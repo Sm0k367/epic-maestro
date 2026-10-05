@@ -1,0 +1,78 @@
+version: '3.9'
+
+services:
+  # Epic Maestro Master (Lenovo)
+  maestro:
+    build: .
+    container_name: epic-maestro-master
+    ports:
+      - "8800:8800"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NODE_NAME=lenovo-master
+    volumes:
+      - ./logs:/app/logs
+      - ./cache:/app/cache
+    networks:
+      - epic-network
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - acer-worker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8800/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Local Ollama (AI inference)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: epic-ollama-local
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - epic-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    restart: unless-stopped
+    # Pull models on startup
+    command: sh -c "ollama serve & sleep 2 && ollama pull llama2 && ollama pull mistral && wait"
+
+  # Acer Worker Node (simulated)
+  acer-worker:
+    image: python:3.12-slim
+    container_name: epic-acer-worker
+    ports:
+      - "8780:8780"
+    volumes:
+      - ./workers:/app/workers
+    networks:
+      - epic-network
+    working_dir: /app
+    restart: unless-stopped
+    command: python3 -m http.server 8780 --directory /app/workers
+
+  # (Optional) Lenovo Gateway
+  lenovo-gateway:
+    image: python:3.12-slim
+    container_name: epic-lenovo-gateway
+    ports:
+      - "18789:18789"
+    volumes:
+      - ./gateway:/app/gateway
+    networks:
+      - epic-network
+    working_dir: /app
+    restart: unless-stopped
+    command: python3 -m http.server 18789 --directory /app/gateway
+
+networks:
+  epic-network:
+    driver: bridge
+
+volumes:
+  ollama_data:
+    driver: local
