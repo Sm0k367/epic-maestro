@@ -13,6 +13,7 @@ Cloudflare syncs decisions and patterns (optional).
 """
 
 from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -26,6 +27,7 @@ sys.path.insert(0, '/workspace/epic-maestro')
 from core.swarm import SwarmConductor, Message
 from core.model_ensemble import ModelEnsemble
 from core.cloudflare_integration import LocalLenovoHub, CloudflareConfig, CloudflareSync
+from core.chat_agent import SOTAChatAgent, chat_with_sota
 
 
 # ============================================================================
@@ -39,7 +41,9 @@ class MaestroSystem:
         self.swarm = SwarmConductor()
         self.ensemble = ModelEnsemble()
         self.hub = LocalLenovoHub()  # Local-first, no cloud by default
+        self.sota = SOTAChatAgent()  # SOTA chat agent
         self.websocket_clients: List[WebSocket] = []
+        self.chat_clients: Dict[str, WebSocket] = {}  # Chat WebSocket clients
         self.decision_log: List[Dict[str, Any]] = []
     
     async def broadcast_to_websockets(self, message: Dict[str, Any]):
@@ -457,6 +461,155 @@ async def parallel_ensemble(prompt: str, num_models: int = 3, task_type: str = "
         "num_models": num_models,
         "results": results
     }
+
+
+# ============================================================================
+# SOTA CHAT AGENT ENDPOINTS
+# ============================================================================
+
+@app.get("/chat", response_class=HTMLResponse)
+async def get_chat_ui():
+    """Serve SOTA chat web interface"""
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SOTA - State-of-the-Art Orchestration Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 900px;
+            height: 90vh;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px 10px 0 0;
+        }
+        .header h1 { font-size: 28px; }
+        .chat-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+        .message { display: flex; gap: 10px; animation: slideIn 0.3s ease-out; }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .message.user { justify-content: flex-end; }
+        .message-content { max-width: 70%; padding: 12px 16px; border-radius: 10px; word-wrap: break-word; }
+        .message.user .message-content { background: #667eea; color: white; }
+        .message.assistant .message-content { background: #f0f0f0; color: #333; }
+        .input-area { padding: 20px; border-top: 1px solid #eee; display: flex; gap: 10px; }
+        .input-area input { flex: 1; padding: 12px; border: 2px solid #eee; border-radius: 25px; font-size: 14px; outline: none; }
+        .input-area input:focus { border-color: #667eea; }
+        .input-area button { padding: 12px 24px; background: #667eea; color: white; border: none; border-radius: 25px; cursor: pointer; font-weight: bold; }
+        .input-area button:hover { background: #764ba2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 SOTA</h1>
+            <p>State-of-the-Art Orchestration Agent</p>
+        </div>
+        <div class="chat-container">
+            <div class="messages" id="messages"></div>
+            <div class="input-area">
+                <input type="text" id="messageInput" placeholder="Ask me anything!" autocomplete="off">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const messagesDiv = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const userId = 'web-' + Math.random().toString(36).substr(2, 9);
+        let ws = null;
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(protocol + '//' + window.location.host + '/ws/chat/' + userId);
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                displayMessage(data.content, data.role);
+            };
+        }
+
+        function displayMessage(content, role) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message ' + role;
+            messageDiv.innerHTML = '<div class="message-content">' + content + '</div>';
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+            messageInput.value = '';
+            displayMessage(message, 'user');
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'message', content: message}));
+            }
+        }
+
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        displayMessage('SOTA Connected! Ask me anything.', 'assistant');
+        connectWebSocket();
+    </script>
+</body>
+</html>
+"""
+
+@app.websocket("/ws/chat/{user_id}")
+async def websocket_chat(websocket: WebSocket, user_id: str):
+    """WebSocket endpoint for SOTA chat"""
+    await websocket.accept()
+    maestro_system.chat_clients[user_id] = websocket
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+            
+            if message_data.get('type') == 'message':
+                response = await chat_with_sota(user_id, message_data['content'])
+                await websocket.send_text(json.dumps({
+                    'role': 'assistant',
+                    'content': response
+                }))
+    except Exception as e:
+        print(f"Chat error: {e}")
+    finally:
+        if user_id in maestro_system.chat_clients:
+            del maestro_system.chat_clients[user_id]
+
+@app.post("/api/chat")
+async def api_chat(user_id: str, message: str):
+    """REST API for SOTA chat"""
+    response = await chat_with_sota(user_id, message)
+    return {'user_id': user_id, 'response': response}
+
+@app.get("/api/chat/history/{user_id}")
+async def get_chat_history(user_id: str):
+    """Get conversation history"""
+    return maestro_system.sota.get_conversation_history(user_id)
 
 
 # ============================================================================
